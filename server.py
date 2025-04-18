@@ -32,7 +32,7 @@ import sys
 import time
 from functools import partial
 from pathlib import Path
-from threading import RLock, Thread
+from threading import Lock, Thread
 
 import yaml
 
@@ -90,7 +90,7 @@ def create_interface():
     # Force some events to be triggered on page load
     shared.persistent_interface_state.update({
         'loader': shared.args.loader or 'Transformers',
-        'mode': shared.settings['mode'],
+        'mode': shared.settings['mode'] if shared.settings['mode'] == 'instruct' else gr.update(),
         'character_menu': shared.args.character or shared.settings['character'],
         'instruction_template_str': shared.settings['instruction_template_str'],
         'prompt_menu-default': shared.settings['prompt-default'],
@@ -146,11 +146,24 @@ def create_interface():
         ui_model_menu.create_event_handlers()
 
         # Interface launch events
-        shared.gradio['interface'].load(lambda: None, None, None, js=f"() => {{if ({str(shared.settings['dark_theme']).lower()}) {{ document.getElementsByTagName('body')[0].classList.add('dark'); }} }}")
-        shared.gradio['interface'].load(lambda: None, None, None, js=f"() => {{{js}}}")
-        shared.gradio['interface'].load(lambda x: None, gradio('show_controls'), None, js=f'(x) => {{{ui.show_controls_js}; toggle_controls(x)}}')
+        shared.gradio['interface'].load(
+            None,
+            gradio('show_controls'),
+            None,
+            js=f"""(x) => {{
+                if ({str(shared.settings['dark_theme']).lower()}) {{
+                    document.getElementsByTagName('body')[0].classList.add('dark');
+                }}
+                else {{
+                    document.getElementsByTagName('body')[0].classList.remove('dark');
+                }}
+                {js}
+                {ui.show_controls_js}
+                toggle_controls(x);
+            }}"""
+        )
+
         shared.gradio['interface'].load(partial(ui.apply_interface_values, {}, use_persistent=True), None, gradio(ui.list_interface_input_elements()), show_progress=False)
-        shared.gradio['interface'].load(chat.redraw_html, gradio(ui_chat.reload_arr), gradio('display'))
 
         extensions_module.create_extensions_tabs()  # Extensions tabs
         extensions_module.create_extensions_block()  # Extensions block
@@ -169,6 +182,7 @@ def create_interface():
             ssl_verify=False if (shared.args.ssl_keyfile or shared.args.ssl_certfile) else True,
             ssl_keyfile=shared.args.ssl_keyfile,
             ssl_certfile=shared.args.ssl_certfile,
+            root_path=shared.args.subpath,
             allowed_paths=["cache", "css", "extensions", "js"]
         )
 
@@ -204,27 +218,9 @@ if __name__ == "__main__":
         if extension not in shared.args.extensions:
             shared.args.extensions.append(extension)
 
-    available_models = utils.get_available_models()
-
     # Model defined through --model
     if shared.args.model is not None:
         shared.model_name = shared.args.model
-
-    # Select the model from a command-line menu
-    elif shared.args.model_menu:
-        if len(available_models) == 0:
-            logger.error('No models are available! Please download at least one.')
-            sys.exit(0)
-        else:
-            print('The following models are available:\n')
-            for i, model in enumerate(available_models):
-                print(f'{i+1}. {model}')
-
-            print(f'\nWhich one do you want to load? 1-{len(available_models)}\n')
-            i = int(input()) - 1
-            print()
-
-        shared.model_name = available_models[i]
 
     # If any model has been selected, load it
     if shared.model_name != 'None':
@@ -243,7 +239,7 @@ if __name__ == "__main__":
         if shared.args.lora:
             add_lora_to_model(shared.args.lora)
 
-    shared.generation_lock = RLock()
+    shared.generation_lock = Lock()
 
     if shared.args.idle_timeout > 0:
         timer_thread = Thread(target=unload_model_if_idle)

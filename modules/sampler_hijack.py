@@ -1,10 +1,10 @@
 import json
 import math
 import pprint
+import random
 
 import torch
 import transformers
-from transformers import LogitsWarper, is_torch_xpu_available
 from transformers.generation.logits_process import (
     LogitNormalization,
     LogitsProcessor,
@@ -13,11 +13,12 @@ from transformers.generation.logits_process import (
 
 from modules import shared
 from modules.logging_colors import logger
+from modules.models import get_device
 
 global_scores = None
 
 
-class TemperatureLogitsWarperCustom(LogitsWarper):
+class TemperatureLogitsWarperCustom(LogitsProcessor):
     '''
     A copy of the original Transformers temperature logits warper.
     '''
@@ -40,7 +41,7 @@ class TemperatureLogitsWarperCustom(LogitsWarper):
         return scores
 
 
-class DynamicTemperatureLogitsWarper(LogitsWarper):
+class DynamicTemperatureLogitsWarper(LogitsProcessor):
     '''
     Dynamic temperature.
     '''
@@ -98,7 +99,7 @@ class DynamicTemperatureLogitsWarper(LogitsWarper):
         return scores
 
 
-class QuadraticSamplingLogitsWarper(LogitsWarper):
+class QuadraticSamplingLogitsWarper(LogitsProcessor):
     '''
     Quadratic sampling with smoothing factor and smoothing curve parameters.
     '''
@@ -125,7 +126,7 @@ class QuadraticSamplingLogitsWarper(LogitsWarper):
         return transformed_logits
 
 
-class TailFreeLogitsWarper(LogitsWarper):
+class TailFreeLogitsWarper(LogitsProcessor):
     def __init__(self, tfs: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         tfs = float(tfs)
         if tfs < 0 or tfs > 1.0:
@@ -165,7 +166,7 @@ class TailFreeLogitsWarper(LogitsWarper):
         return scores
 
 
-class TopALogitsWarper(LogitsWarper):
+class TopALogitsWarper(LogitsProcessor):
     def __init__(self, top_a: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         top_a = float(top_a)
         if top_a < 0 or top_a > 1.0:
@@ -187,6 +188,93 @@ class TopALogitsWarper(LogitsWarper):
             sorted_indices_to_remove[..., : self.min_tokens_to_keep] = 0
 
         indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        scores = scores.masked_fill(indices_to_remove, self.filter_value)
+        return scores
+
+
+class TopNSigmaLogitsWarper(LogitsProcessor):
+    def __init__(self, n_sigma: float = 2.0, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+        """
+        Initialize Top-nσ Sampling logits warper.
+
+        Args:
+            n_sigma: The threshold multiplier for standard deviation
+            filter_value: Value to assign to filtered logits
+            min_tokens_to_keep: Minimum number of tokens to keep
+        """
+        if n_sigma < 0:
+            raise ValueError(f"`n_sigma` must be a non-negative float, but is {n_sigma}")
+        self.n_sigma = n_sigma
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Calculate max of logits
+        max_logit = torch.max(scores, dim=-1, keepdim=True)[0]
+
+        # Calculate standard deviation only on finite values
+        finite_mask = torch.isfinite(scores)
+        finite_scores = scores.masked_fill(~finite_mask, 0.0)
+        std_logit = torch.std(finite_scores, dim=-1, keepdim=True)
+
+        # Create mask where tokens with logits >= max_logit - n_sigma * std_logit are kept
+        threshold = max_logit - self.n_sigma * std_logit
+        indices_to_remove = scores < threshold
+
+        if self.min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep tokens
+            top_k_indices = torch.topk(scores, self.min_tokens_to_keep, dim=-1)[1]
+            indices_to_remove.scatter_(-1, top_k_indices, False)
+
+        # Apply mask by setting filtered tokens to filter_value
+        scores = scores.masked_fill(indices_to_remove, self.filter_value)
+
+        return scores
+
+
+# Exclude Top Choices (XTC)
+class XTCLogitsWarper(LogitsProcessor):
+    def __init__(self, threshold: float, probability: float, filter_value: float = -float("Inf")):
+        self.threshold = threshold
+        self.probability = probability
+        self.filter_value = filter_value
+        self.special_token_ids = [
+            shared.tokenizer.encode("\n")[-1],
+        ]
+
+        if shared.tokenizer.eos_token_id is not None:
+            self.special_token_ids.append(shared.tokenizer.eos_token_id)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # `random` returns values in the half-open range [0, 1), so setting `probability`
+        # to 0 means the sampler never takes action, while setting it to 1 means the sampler
+        # always takes action.
+        #
+        # Note that while XTC is most intuitively described as "if multiple tokens meet
+        # the threshold, then with probability...", reversing the two conditions is logically
+        # equivalent, and improves performance because processing can immediately be stopped
+        # if the random check fails.
+        if random.random() >= self.probability:
+            return scores
+
+        sorted_logits, sorted_indices = torch.sort(scores, descending=True)
+        probs = sorted_logits.softmax(dim=-1)
+
+        sorted_indices_to_remove = torch.full_like(probs, False, dtype=torch.bool)
+
+        # This operation sets exactly those indices to `True` for which the next index has
+        # probability above the threshold. Since `probs` is sorted, those are the indices
+        # of all tokens that meet the threshold, *except* the least probable one.
+        sorted_indices_to_remove[..., :-1] = probs[..., 1:] >= self.threshold
+
+        # Convert sorted_indices_to_remove to the original indices
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+
+        # If newline or EOS tokens would be removed, return the original scores
+        if indices_to_remove[:, self.special_token_ids].any():
+            return scores
+
+        # Otherwise, remove tokens with the mask
         scores = scores.masked_fill(indices_to_remove, self.filter_value)
         return scores
 
@@ -263,7 +351,7 @@ class DRYLogitsProcessor(LogitsProcessor):
         return scores
 
 
-class MirostatLogitsWarper(LogitsWarper):
+class MirostatLogitsWarper(LogitsProcessor):
     def __init__(self, mirostat_mode: int, mirostat_tau: float, mirostat_eta: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         if mirostat_mode not in [2]:
             raise ValueError(f"`mirostat` has to be a an integer 2, but is {mirostat_mode}")
@@ -291,12 +379,12 @@ class MirostatLogitsWarper(LogitsWarper):
                 break
 
         # Normalize the probabilities of the remaining words
-        if is_torch_xpu_available():
-            prob_topk = torch.softmax(sorted_logits, dim=0).to("xpu")
-            prev_i = torch.multinomial(prob_topk, num_samples=1, replacement=True).to("xpu")
-        else:
-            prob_topk = torch.softmax(sorted_logits, dim=0).to('cuda')
-            prev_i = torch.multinomial(prob_topk, num_samples=1, replacement=True).to('cuda')
+        prob_topk = torch.softmax(sorted_logits, dim=0)
+        prev_i = torch.multinomial(prob_topk, num_samples=1, replacement=True)
+        device = get_device()
+        if device:
+            prob_topk = prob_topk.to(device)
+            prev_i = prev_i.to(device)
 
         observed_surprise = -math.log2(prob_topk[prev_i])
         self.e = observed_surprise - self.mirostat_tau
@@ -312,7 +400,7 @@ class MirostatLogitsWarper(LogitsWarper):
         return scores
 
 
-class SpyLogitsWarper(LogitsWarper):
+class SpyLogitsWarper(LogitsProcessor):
     def __init__(self):
         pass
 
@@ -323,62 +411,143 @@ class SpyLogitsWarper(LogitsWarper):
 
 
 class RepetitionPenaltyLogitsProcessorWithRange(LogitsProcessor):
-    '''
-    Copied from the transformers library
-    '''
-
-    def __init__(self, penalty: float, presence_penalty: float, frequency_penalty: float, _range: int):
+    def __init__(self, penalty: float, _range: int):
         if not (penalty > 0):
             raise ValueError(f"`penalty` has to be strictly positive, but is {penalty}")
-
         self.penalty = penalty
-        self.presence_penalty = presence_penalty
-        self.frequency_penalty = frequency_penalty
         self._range = _range
+
+    def apply_repetition_penalty(self, input_ids_row, scores_row):
+        unique_ids = torch.unique(input_ids_row)
+        score = torch.gather(scores_row, 0, unique_ids)
+
+        # Apply multiplicative repetition penalty
+        score = torch.where(score < 0, score * self.penalty, score / self.penalty)
+        scores_row.scatter_(0, unique_ids, score)
+        return scores_row
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         input_ids = input_ids[:, -self._range:]
-
-        # We loop here because torch.unique() needs to process each row separately in the
-        # case that batch_size > 1.
         for input_ids_row, scores_row in zip(input_ids, scores):
-            unique_ids, counts = torch.unique(input_ids_row, return_counts=True)
-            score = torch.gather(scores_row, 0, unique_ids)
-
-            # multiplicative repetition penalty
-            # if score < 0 then repetition penalty has to be multiplied to reduce the previous token probability
-            score = torch.where(score < 0, score * self.penalty, score / self.penalty)
-            scores_row.scatter_(0, unique_ids, score)
-
-            # presence_penalty and frequency_penalty
-            raw_presence_penalty = (counts > 0).to(scores.dtype)
-            raw_frequency_penalty = counts.to(scores.dtype)
-            additive_penalty = raw_presence_penalty * self.presence_penalty + raw_frequency_penalty * self.frequency_penalty
-            scores_row.scatter_add_(0, unique_ids, -additive_penalty)
+            scores_row = self.apply_repetition_penalty(input_ids_row, scores_row)
 
         return scores
 
 
-def get_logits_warper_patch(self, generation_config):
+class PresencePenaltyLogitsProcessor(LogitsProcessor):
+    def __init__(self, presence_penalty: float, _range: int):
+        self.presence_penalty = presence_penalty
+        self._range = _range
+
+    def apply_presence_penalty(self, input_ids_row, scores_row):
+        unique_ids, counts = torch.unique(input_ids_row, return_counts=True)
+
+        # Apply presence penalty
+        raw_presence_penalty = (counts > 0).to(scores_row.dtype)
+        presence_penalty = raw_presence_penalty * self.presence_penalty
+        scores_row.scatter_add_(0, unique_ids, -presence_penalty)
+        return scores_row
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        input_ids = input_ids[:, -self._range:]
+        for input_ids_row, scores_row in zip(input_ids, scores):
+            scores_row = self.apply_presence_penalty(input_ids_row, scores_row)
+        return scores
+
+
+class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
+    def __init__(self, frequency_penalty: float, _range: int):
+        self.frequency_penalty = frequency_penalty
+        self._range = _range
+
+    def apply_frequency_penalty(self, input_ids_row, scores_row):
+        unique_ids, counts = torch.unique(input_ids_row, return_counts=True)
+
+        # Apply frequency penalty
+        raw_frequency_penalty = counts.to(scores_row.dtype)
+        frequency_penalty = raw_frequency_penalty * self.frequency_penalty
+        scores_row.scatter_add_(0, unique_ids, -frequency_penalty)
+        return scores_row
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        input_ids = input_ids[:, -self._range:]
+        for input_ids_row, scores_row in zip(input_ids, scores):
+            scores_row = self.apply_frequency_penalty(input_ids_row, scores_row)
+        return scores
+
+
+def get_logits_processor_patch(self, **kwargs):
+    generation_config = kwargs['generation_config']
 
     # Parameter sanitization
     if isinstance(generation_config.temperature, int):
         generation_config.temperature = float(generation_config.temperature)  # Must be float
 
     # Get the original warpers
-    warpers = self._get_logits_warper_old(generation_config)
+    warpers = self._get_logits_processor_old(**kwargs)
 
-    # Replace temperature with our modified class.
-    # Currently, it behaves identically to the original.
-    for i in range(len(warpers)):
+    for i in range(len(warpers) - 1, -1, -1):
+        # Replace temperature with our modified class.
         if warpers[i].__class__.__name__ == 'TemperatureLogitsWarper':
             warpers[i] = TemperatureLogitsWarperCustom(
                 generation_config.temperature,
             )
 
+        # Stuff we don't need
+        elif warpers[i].__class__.__name__ in ['RepetitionPenaltyLogitsProcessor']:
+            del warpers[i]
+
     # Add custom warpers
     warpers_to_add = LogitsProcessorList()
     min_tokens_to_keep = 2 if generation_config.num_beams > 1 else 1
+
+    if generation_config.repetition_penalty is not None and generation_config.repetition_penalty != 1.0:
+        warpers_to_add.append(
+            RepetitionPenaltyLogitsProcessorWithRange(
+                penalty=generation_config.repetition_penalty,
+                _range=generation_config.repetition_penalty_range
+            )
+        )
+
+    if generation_config.presence_penalty is not None and generation_config.presence_penalty != 0.0:
+        warpers_to_add.append(
+            PresencePenaltyLogitsProcessor(
+                presence_penalty=generation_config.presence_penalty,
+                _range=generation_config.repetition_penalty_range
+            )
+        )
+
+    if generation_config.frequency_penalty is not None and generation_config.frequency_penalty != 0.0:
+        warpers_to_add.append(
+            FrequencyPenaltyLogitsProcessor(
+                frequency_penalty=generation_config.frequency_penalty,
+                _range=generation_config.repetition_penalty_range
+            )
+        )
+
+    if generation_config.dry_multiplier is not None and generation_config.dry_multiplier > 0.0:
+        dry_sequence_breakers = generation_config.dry_sequence_breakers
+
+        # Support both JSON array notation and comma-separated strings.
+        if not dry_sequence_breakers.startswith("["):
+            dry_sequence_breakers = "[" + dry_sequence_breakers + "]"
+
+        sequence_breaker_strings = json.loads(dry_sequence_breakers)
+        # Prefix with 'a' to get the correct encoding of the token at the end of a text.
+        sequence_breakers = {
+            shared.tokenizer.encode(f'a{s}')[-1] for s in sequence_breaker_strings
+        }
+
+        warpers.append(
+            DRYLogitsProcessor(
+                multiplier=generation_config.dry_multiplier,
+                base=generation_config.dry_base,
+                allowed_length=generation_config.dry_allowed_length,
+                sequence_breakers=sequence_breakers,
+                _range=generation_config.repetition_penalty_range,
+            )
+        )
+
     if generation_config.tfs is not None and 0.0 <= generation_config.tfs < 1.0:
         warpers_to_add.append(
             TailFreeLogitsWarper(
@@ -392,6 +561,22 @@ def get_logits_warper_patch(self, generation_config):
             TopALogitsWarper(
                 top_a=generation_config.top_a,
                 min_tokens_to_keep=min_tokens_to_keep
+            )
+        )
+
+    if generation_config.top_n_sigma is not None and generation_config.top_n_sigma > 0.0:
+        warpers_to_add.append(
+            TopNSigmaLogitsWarper(
+                n_sigma=generation_config.top_n_sigma,
+                min_tokens_to_keep=min_tokens_to_keep
+            )
+        )
+
+    if generation_config.xtc_probability is not None and generation_config.xtc_probability > 0:
+        warpers_to_add.append(
+            XTCLogitsWarper(
+                threshold=generation_config.xtc_threshold,
+                probability=generation_config.xtc_probability,
             )
         )
 
@@ -436,11 +621,10 @@ def get_logits_warper_patch(self, generation_config):
     if generation_config.temperature_last:
         for param_name in ['temperature', 'dynamic_temperature', 'quadratic_sampling']:
             if param_name in sampler_priority:
-                if param_name in sampler_priority:
-                    index = sampler_priority.index(param_name)
-                    sampler_priority.append(sampler_priority.pop(index))
-                else:
-                    sampler_priority.append(param_name)
+                index = sampler_priority.index(param_name)
+                sampler_priority.append(sampler_priority.pop(index))
+            else:
+                sampler_priority.append(param_name)
 
     class_name_to_nickname = {
         'DynamicTemperatureLogitsWarper': 'dynamic_temperature',
@@ -452,19 +636,26 @@ def get_logits_warper_patch(self, generation_config):
         'TailFreeLogitsWarper': 'tfs',
         'TemperatureLogitsWarperCustom': 'temperature',
         'TopALogitsWarper': 'top_a',
+        'TopNSigmaLogitsWarper': 'top_n_sigma',
         'TopKLogitsWarper': 'top_k',
         'TopPLogitsWarper': 'top_p',
-        'TypicalLogitsWarper': 'typical_p'
+        'TypicalLogitsWarper': 'typical_p',
+        'XTCLogitsWarper': 'xtc',
+        'RepetitionPenaltyLogitsProcessorWithRange': 'repetition_penalty',
+        'PresencePenaltyLogitsProcessor': 'presence_penalty',
+        'FrequencyPenaltyLogitsProcessor': 'frequency_penalty',
+        'DRYLogitsProcessor': 'dry',
+        'EncoderRepetitionPenaltyLogitsProcessor': 'encoder_repetition_penalty',
+        'NoRepeatNGramLogitsProcessor': 'no_repeat_ngram',
     }
 
     def custom_sort_key(obj):
         class_name = obj.__class__.__name__
 
-        # Return a large value if class name is not mapped or if the mapped nickname is not in priority
+        # Return -1 if class_name is not mapped
         if class_name not in class_name_to_nickname or class_name_to_nickname[class_name] not in sampler_priority:
-            return float('inf')
+            return -1
 
-        # Return the index of the nickname in the priority list for sorting
         return sampler_priority.index(class_name_to_nickname[class_name])
 
     # Sort the list using the custom key function
@@ -482,49 +673,6 @@ def get_logits_warper_patch(self, generation_config):
     return warpers
 
 
-def get_logits_processor_patch(self, **kwargs):
-    generation_config = kwargs['generation_config']
-
-    do_rep_pen_hijack = (generation_config.repetition_penalty > 1) or (generation_config.presence_penalty != 0) or (generation_config.frequency_penalty != 0)
-    if do_rep_pen_hijack:
-        generation_config.repetition_penalty = 1.1  # Set to value > 1 to ensure RepetitionPenaltyLogitsProcessor is created
-
-    result = self._get_logits_processor_old(**kwargs)
-
-    if do_rep_pen_hijack:
-        for i in range(len(result)):
-            if result[i].__class__.__name__ == 'RepetitionPenaltyLogitsProcessor':
-                result[i] = RepetitionPenaltyLogitsProcessorWithRange(
-                    generation_config.repetition_penalty,
-                    generation_config.presence_penalty,
-                    generation_config.frequency_penalty,
-                    generation_config.repetition_penalty_range
-                )
-
-    if generation_config.dry_multiplier is not None and generation_config.dry_multiplier > 0.0:
-        dry_sequence_breakers = generation_config.dry_sequence_breakers
-
-        # Support both JSON array notation and comma-separated strings.
-        if not dry_sequence_breakers.startswith("["):
-            dry_sequence_breakers = "[" + dry_sequence_breakers + "]"
-
-        sequence_breaker_strings = json.loads(dry_sequence_breakers)
-        # Prefix with 'a' to get the correct encoding of the token at the end of a text.
-        sequence_breakers = {shared.tokenizer.encode(f'a{s}')[-1] for s in sequence_breaker_strings}
-
-        result.append(
-            DRYLogitsProcessor(
-                multiplier=generation_config.dry_multiplier,
-                base=generation_config.dry_base,
-                allowed_length=generation_config.dry_allowed_length,
-                sequence_breakers=sequence_breakers,
-                _range=generation_config.repetition_penalty_range,
-            )
-        )
-
-    return result
-
-
 def generation_config_init_patch(self, **kwargs):
     self.__init___old(**kwargs)
     self.min_p = kwargs.pop("min_p", 0.0)
@@ -536,6 +684,7 @@ def generation_config_init_patch(self, **kwargs):
     self.smoothing_curve = kwargs.pop("smoothing_curve", 1.0)
     self.tfs = kwargs.pop("tfs", 1.0)
     self.top_a = kwargs.pop("top_a", 0.0)
+    self.top_n_sigma = kwargs.pop("top_n_sigma", 0.0)
     self.mirostat_mode = kwargs.pop("mirostat_mode", 0)
     self.mirostat_eta = kwargs.pop("mirostat_eta", 0.1)
     self.mirostat_tau = kwargs.pop("mirostat_tau", 5)
@@ -546,14 +695,13 @@ def generation_config_init_patch(self, **kwargs):
     self.dry_base = kwargs.pop("dry_base", 1.75)
     self.dry_allowed_length = kwargs.pop("dry_allowed_length", 2)
     self.dry_sequence_breakers = kwargs.pop("dry_sequence_breakers", '"\\n", ":", "\\"", "*"')
+    self.xtc_threshold = kwargs.pop("xtc_threshold", 0.1)
+    self.xtc_probability = kwargs.pop("xtc_probability", 0)
     self.temperature_last = kwargs.pop("temperature_last", False)
-    self.sampler_priority = kwargs.pop("sampler_priority", ['temperature', 'dynamic_temperature', 'quadratic_sampling', 'top_k', 'top_p', 'typical_p', 'epsilon_cutoff', 'eta_cutoff', 'tfs', 'top_a', 'min_p', 'mirostat'])
+    self.sampler_priority = kwargs.pop("sampler_priority", ['repetition_penalty', 'presence_penalty', 'frequency_penalty', 'dry', 'temperature', 'dynamic_temperature', 'quadratic_sampling', 'top_n_sigma', 'top_k', 'top_p', 'typical_p', 'epsilon_cutoff', 'eta_cutoff', 'tfs', 'top_a', 'min_p', 'mirostat', 'xtc', 'encoder_repetition_penalty', 'no_repeat_ngram'])
 
 
 def hijack_samplers():
-    transformers.GenerationMixin._get_logits_warper_old = transformers.GenerationMixin._get_logits_warper
-    transformers.GenerationMixin._get_logits_warper = get_logits_warper_patch
-
     transformers.GenerationMixin._get_logits_processor_old = transformers.GenerationMixin._get_logits_processor
     transformers.GenerationMixin._get_logits_processor = get_logits_processor_patch
 
